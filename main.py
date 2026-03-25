@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+""".
+"""
 
 import sys
 import os
@@ -47,6 +49,7 @@ def print_menu() -> None:
     table.add_row("[3]", "PoC Suggester")
     table.add_row("[4]", "All-in-One  (CVSS → Report with auto-filled score)")
     table.add_row("[5]", "Severity Reference Chart")
+    table.add_row("[6]", "Active Scanner  — full recon + vuln scan on a target URL")
     table.add_row("[Q]", "Quit")
 
     console.print("\n")
@@ -107,6 +110,11 @@ def run_all_in_one() -> None:
     )
 
 
+
+def run_scanner() -> None:
+    from scanner import run_scanner as _run_scanner
+    _run_scanner()
+
 def main() -> None:
     print_banner()
 
@@ -124,13 +132,19 @@ def main() -> None:
             run_all_in_one()
         elif choice == "5":
             severity_chart()
+        elif choice == "6":
+            run_scanner()
         elif choice in ("Q", "QUIT", "EXIT"):
             console.print("\n[bold cyan]  Stay safe and hack ethically. Goodbye![/bold cyan]\n")
             sys.exit(0)
         else:
-            console.print("[red]  Invalid option. Choose 1–5 or Q.[/red]")
+            console.print("[red]  Invalid option. Choose 1-6 or Q.[/red]")
 
         input("\n  [Press Enter to return to menu]")
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
