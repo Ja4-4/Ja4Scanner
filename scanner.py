@@ -322,6 +322,540 @@ def _measure_baseline_rtt(session: requests.Session, point: dict,
     return sum(times) / max(len(times), 1)
 
 
+# ── WebCrawler ────────────────────────────────────────────────────────────────
+
+class WebCrawler:
+    """
+    BFS web crawler that discovers injection points across an entire site.
+
+    Collects:
+      - URL query parameters  (?key=value)
+      - HTML form fields      (<form action method input>)
+
+    Returns a deduplicated list of injection-point dicts compatible with
+    _inject() — the same format used by XSS and SQLi scanners.
+    """
+
+    MAX_DEPTH  = 3
+    MAX_PAGES  = 50
+    MAX_WORKERS = 5
+
+    IGNORE_EXT = {
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
+        ".css", ".js", ".mjs",
+        ".pdf", ".zip", ".tar", ".gz", ".rar",
+        ".ico", ".svg", ".woff", ".woff2", ".ttf", ".eot",
+        ".mp4", ".mp3", ".avi", ".mov", ".wav",
+        ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+        ".xml",
+    }
+
+    def __init__(self, base_url: str, session: requests.Session, timeout: int = 5):
+        self.base_url = base_url
+        self.origin   = _origin(base_url)
+        self.domain   = _extract_domain(base_url)
+        self.session  = session
+        self.timeout  = timeout
+
+        self._visited:    set  = set()
+        self._lock               = __import__("threading").Lock()
+        self.pages_crawled: int = 0
+
+        # Collected data
+        self.crawled_urls: list[str]  = []
+        self.all_forms:    list[dict] = []   # {action, method, fields, source_page}
+        self.all_url_params: list[dict] = [] # {url, params{}}
+
+    # ── Public entry point ────────────────────────────────────────────────────
+
+    def crawl(self) -> list[dict]:
+        """
+        Crawl the site BFS up to MAX_DEPTH / MAX_PAGES.
+        Returns deduplicated injection-point list for XSS/SQLi scanners.
+        """
+        console.print("\n[bold cyan][pre-scan] Web Crawler starting...[/bold cyan]")
+        console.print(
+            f"  [dim]Max pages: {self.MAX_PAGES}  |  "
+            f"Max depth: {self.MAX_DEPTH}  |  "
+            f"Workers: {self.MAX_WORKERS}[/dim]"
+        )
+
+        # BFS queue: list of (url, depth)
+        queue:  list[tuple[str, int]] = [(self.base_url, 0)]
+        self._mark_visited(self.base_url)
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total} pages"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        ) as pg:
+            task = pg.add_task("Crawling...", total=self.MAX_PAGES)
+
+            with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as ex:
+                while queue and self.pages_crawled < self.MAX_PAGES:
+                    # Take a batch of up to MAX_WORKERS URLs from the queue
+                    batch, queue = (
+                        queue[:self.MAX_WORKERS],
+                        queue[self.MAX_WORKERS:],
+                    )
+
+                    futures = {
+                        ex.submit(self._fetch_page, url, depth): (url, depth)
+                        for url, depth in batch
+                        if self.pages_crawled < self.MAX_PAGES
+                    }
+
+                    for f in as_completed(futures):
+                        result = f.result()
+                        if result is None:
+                            continue
+
+                        url, depth, links, forms, url_params = result
+
+                        self.pages_crawled += 1
+                        self.crawled_urls.append(url)
+
+                        # Store forms and URL params
+                        self.all_forms.extend(forms)
+                        self.all_url_params.extend(url_params)
+
+                        pg.update(task, description=f"Crawling: {url[:60]}",
+                                  completed=self.pages_crawled)
+
+                        # Enqueue new internal links at next depth
+                        if depth < self.MAX_DEPTH:
+                            for link in links:
+                                if (self.pages_crawled + len(queue) < self.MAX_PAGES
+                                        and not self._is_visited(link)):
+                                    self._mark_visited(link)
+                                    queue.append((link, depth + 1))
+
+        console.print(
+            f"  Crawled [green]{self.pages_crawled}[/green] pages  |  "
+            f"Forms found [yellow]{len(self.all_forms)}[/yellow]  |  "
+            f"URL params [yellow]{len(self.all_url_params)}[/yellow]"
+        )
+
+        return self._build_injection_points()
+
+    # ── Per-page fetch ────────────────────────────────────────────────────────
+
+    def _fetch_page(
+        self, url: str, depth: int
+    ) -> Optional[tuple[str, int, list, list, list]]:
+        """
+        Fetch one page and extract links, forms, URL params.
+        Returns (url, depth, links, forms, url_params) or None on error.
+        """
+        try:
+            r = self.session.get(
+                url, timeout=self.timeout, verify=False,
+                allow_redirects=True,
+            )
+            if r.status_code >= 400:
+                return None
+            ct = r.headers.get("Content-Type", "")
+            if "text/html" not in ct and "text/plain" not in ct:
+                return None
+
+            html       = r.text
+            links      = self._extract_links(html, url)
+            forms      = self._extract_forms(html, url)
+            url_params = self._extract_url_params(url)
+            return url, depth, links, forms, url_params
+
+        except Exception:
+            return None
+
+    # ── Link extraction ───────────────────────────────────────────────────────
+
+    def _extract_links(self, html: str, current_url: str) -> list[str]:
+        """Return internal links found on the page, normalised and filtered."""
+        raw_hrefs = re.findall(r'<a[^>]+href=["\']([^"\'#][^"\']*)["\']',
+                               html, re.IGNORECASE)
+        links = []
+        for href in raw_hrefs:
+            href = href.strip()
+            if not href or href.startswith(("mailto:", "tel:", "javascript:")):
+                continue
+
+            # Resolve relative URLs
+            abs_url = urllib.parse.urljoin(current_url, href)
+
+            # Strip fragment
+            abs_url = abs_url.split("#")[0].rstrip("/") or abs_url
+
+            # Internal only
+            parsed = urllib.parse.urlparse(abs_url)
+            if parsed.hostname != self.domain:
+                continue
+
+            # Ignore unwanted extensions
+            path = parsed.path.lower()
+            if any(path.endswith(ext) for ext in self.IGNORE_EXT):
+                continue
+
+            links.append(abs_url)
+
+        return list(dict.fromkeys(links))  # deduplicate, preserve order
+
+    # ── Form extraction ───────────────────────────────────────────────────────
+
+    def _extract_forms(self, html: str, page_url: str) -> list[dict]:
+        """Extract forms from HTML, return list of form dicts."""
+        forms = _parse_forms(html, page_url)   # reuse existing helper
+        # Attach source_page to each
+        for f in forms:
+            f["source_page"] = page_url
+        return forms
+
+    # ── URL param extraction ──────────────────────────────────────────────────
+
+    def _extract_url_params(self, url: str) -> list[dict]:
+        """Return list of {url, params} dicts for each URL query string."""
+        parsed = urllib.parse.urlparse(url)
+        qs     = urllib.parse.parse_qs(parsed.query)
+        if not qs:
+            return []
+        return [{"url": url, "params": {k: v[0] for k, v in qs.items()}}]
+
+    # ── Visited tracking (thread-safe) ────────────────────────────────────────
+
+    def _mark_visited(self, url: str) -> None:
+        # Normalise: strip trailing slash and fragment
+        key = url.split("#")[0].rstrip("/")
+        with self._lock:
+            self._visited.add(key)
+
+    def _is_visited(self, url: str) -> bool:
+        key = url.split("#")[0].rstrip("/")
+        with self._lock:
+            return key in self._visited
+
+    # ── Build injection point list ────────────────────────────────────────────
+
+    def _build_injection_points(self) -> list[dict]:
+        """
+        Convert collected forms + URL params into the injection-point dict
+        format expected by _inject() and the XSS/SQLi scanners.
+
+        Each point:  {type, url, method, param, data, source_page}
+        """
+        points: list[dict] = []
+        seen:   set        = set()
+
+        # URL parameters
+        for entry in self.all_url_params:
+            url    = entry["url"]
+            params = entry["params"]
+            for param in params:
+                key = ("url", url, param)
+                if key in seen:
+                    continue
+                seen.add(key)
+                points.append({
+                    "type":        "url",
+                    "url":         url,
+                    "method":      "GET",
+                    "param":       param,
+                    "data":        dict(params),
+                    "source_page": url,
+                })
+
+        # Form fields
+        for form in self.all_forms:
+            action      = form["action"]
+            method      = form["method"]
+            source_page = form.get("source_page", action)
+            for field in form["fields"]:
+                key = ("form", action, field)
+                if key in seen:
+                    continue
+                seen.add(key)
+                points.append({
+                    "type":        "form",
+                    "url":         action,
+                    "method":      method,
+                    "param":       field,
+                    "data":        {f: "test" for f in form["fields"]},
+                    "source_page": source_page,
+                })
+
+        return points
+
+    # ── Summary table ─────────────────────────────────────────────────────────
+
+    def print_crawl_summary(self) -> None:
+        if not self.crawled_urls:
+            return
+        table = Table(
+            title=f"Crawled Pages ({len(self.crawled_urls)})",
+            box=box.ROUNDED, border_style="cyan",
+        )
+        table.add_column("Page URL", style="dim", overflow="fold")
+        for url in self.crawled_urls[:30]:   # cap display at 30
+            table.add_row(url)
+        if len(self.crawled_urls) > 30:
+            table.add_row(f"[dim]... and {len(self.crawled_urls)-30} more[/dim]")
+        console.print(table)
+
+
+# ── Form parser ───────────────────────────────────────────────────────────────
+
+def _parse_forms(html: str, page_url: str) -> list[dict]:
+    """
+    Extract all <form> elements from HTML.
+    Returns list of {action, method, fields} dicts.
+    """
+    forms   = []
+    # Find every <form ...> ... </form> block
+    for form_html in re.findall(r'<form[^>]*>.*?</form>', html,
+                                re.IGNORECASE | re.DOTALL):
+        # action
+        action_m = re.search(r'action=["\']([^"\']*)["\']', form_html, re.IGNORECASE)
+        action   = action_m.group(1).strip() if action_m else page_url
+        action   = urllib.parse.urljoin(page_url, action)
+
+        # method
+        method_m = re.search(r'method=["\']([^"\']*)["\']', form_html, re.IGNORECASE)
+        method   = (method_m.group(1).upper() if method_m else "GET")
+
+        # input / textarea / select names
+        fields = re.findall(
+            r'<(?:input|textarea|select)[^>]+name=["\']([^"\']+)["\']',
+            form_html, re.IGNORECASE,
+        )
+        # filter out submit / button / hidden inputs (keep text, search, password, etc.)
+        skip_types = {"submit", "button", "image", "reset", "file", "checkbox", "radio"}
+        final_fields = []
+        for name in fields:
+            type_m = re.search(
+                r'name=["\']' + re.escape(name) + r'["\'][^>]*type=["\']([^"\']+)["\']|'
+                r'type=["\']([^"\']+)["\'][^>]*name=["\']' + re.escape(name) + r'["\']',
+                form_html, re.IGNORECASE,
+            )
+            if type_m:
+                t = (type_m.group(1) or type_m.group(2) or "text").lower()
+                if t in skip_types:
+                    continue
+            final_fields.append(name)
+
+        if final_fields:
+            forms.append({"action": action, "method": method, "fields": final_fields})
+    return forms
+
+
+# ── Injection helper ──────────────────────────────────────────────────────────
+
+def _inject(session: requests.Session, point: dict,
+            payload: str, timeout: int) -> Optional[requests.Response]:
+    """
+    Send one injection request for the given injection point.
+    Supports both URL-parameter (GET) and form (GET/POST) points.
+    """
+    url    = point["url"]
+    method = point.get("method", "GET").upper()
+    param  = point["param"]
+    data   = dict(point.get("data", {}))
+    data[param] = payload
+
+    try:
+        if method == "POST":
+            return session.post(url, data=data, timeout=timeout,
+                                verify=False, allow_redirects=True)
+        else:
+            parsed = urllib.parse.urlparse(url)
+            qs     = urllib.parse.parse_qs(parsed.query)
+            qs[param] = [payload]
+            new_qs  = urllib.parse.urlencode(qs, doseq=True)
+            new_url = urllib.parse.urlunparse(parsed._replace(query=new_qs))
+            return session.get(new_url, timeout=timeout,
+                               verify=False, allow_redirects=True)
+    except Exception:
+        return None
+
+
+# ── Single-page injection-point collector (fallback) ─────────────────────────
+
+def _collect_injection_points(base_url: str, session: requests.Session,
+                               timeout: int) -> list[dict]:
+    """
+    Fallback: collect injection points from just the homepage
+    (used when the crawler is not available).
+    """
+    points: list[dict] = []
+    try:
+        r = session.get(base_url, timeout=timeout, verify=False, allow_redirects=True)
+    except Exception:
+        return points
+
+    html = r.text
+
+    # URL parameters on the landing URL
+    parsed = urllib.parse.urlparse(base_url)
+    qs     = urllib.parse.parse_qs(parsed.query)
+    for param, values in qs.items():
+        points.append({
+            "type":        "url",
+            "url":         base_url,
+            "method":      "GET",
+            "param":       param,
+            "data":        {param: values[0]},
+            "source_page": base_url,
+        })
+
+    # Forms on the page
+    for form in _parse_forms(html, base_url):
+        for field in form["fields"]:
+            points.append({
+                "type":        "form",
+                "url":         form["action"],
+                "method":      form["method"],
+                "param":       field,
+                "data":        {f: "test" for f in form["fields"]},
+                "source_page": base_url,
+            })
+
+    return points
+
+
+# ── Print helpers ─────────────────────────────────────────────────────────────
+
+def _print_headers_table(headers: list) -> None:
+    table = Table(title="Security Headers", box=box.ROUNDED, border_style="cyan")
+    table.add_column("Header",      style="bold white", overflow="fold")
+    table.add_column("Status",      justify="center")
+    table.add_column("Risk",        justify="center")
+    table.add_column("Value / Reason", style="dim", overflow="fold")
+    for h in headers:
+        status_color = "green" if h["status"] == "PRESENT" else "red"
+        risk_color   = RISK_COLOR.get(h["risk"], "white")
+        table.add_row(
+            h["header"],
+            f"[{status_color}]{h['status']}[/{status_color}]",
+            f"[{risk_color}]{h['risk']}[/{risk_color}]",
+            h.get("reason") or h.get("value", ""),
+        )
+    console.print(table)
+
+
+def _print_ssl_table(info: dict) -> None:
+    if not info or info.get("skipped"):
+        return
+    table = Table(title="SSL Certificate", box=box.ROUNDED, border_style="cyan")
+    table.add_column("Field", style="bold white")
+    table.add_column("Value", overflow="fold")
+    if not info.get("valid", True) and "error" in info:
+        table.add_row("Status", "[red]INVALID[/red]")
+        table.add_row("Error",  info["error"])
+    else:
+        days  = info.get("days_left", "?")
+        dcolor = "red" if isinstance(days, int) and days < 0 else (
+                  "yellow" if isinstance(days, int) and days < 30 else "green")
+        table.add_row("Subject",      info.get("subject", "?"))
+        table.add_row("Issuer",       info.get("issuer",  "?"))
+        table.add_row("Expires",      info.get("expires", "?"))
+        table.add_row("Days Left",    f"[{dcolor}]{days}[/{dcolor}]")
+        table.add_row("TLS Version",  info.get("tls_version", "?"))
+        table.add_row("Self-Signed",  "[red]YES[/red]" if info.get("is_self_signed") else "[green]No[/green]")
+        table.add_row("Domain Match", "[green]Yes[/green]" if info.get("domain_match") else "[red]NO[/red]")
+        if info.get("weak_tls"):
+            table.add_row("Weak TLS",    "[red]" + ", ".join(info["weak_tls"]) + "[/red]")
+    console.print(table)
+
+
+def _print_ports_table(ports: list) -> None:
+    table = Table(title="Port Scan", box=box.ROUNDED, border_style="cyan")
+    table.add_column("Port",    justify="right")
+    table.add_column("Service", style="bold white")
+    table.add_column("Status",  justify="center")
+    table.add_column("Risk",    justify="center")
+    table.add_column("Context", style="dim", overflow="fold")
+    for port, service, is_open, risk, context, banner in ports:
+        status_str  = "[green]OPEN[/green]" if is_open else "[dim]closed[/dim]"
+        risk_color  = RISK_COLOR.get(risk, "white")
+        detail      = context + (f" | Banner: {banner}" if banner else "")
+        table.add_row(str(port), service, status_str,
+                      f"[{risk_color}]{risk}[/{risk_color}]", detail)
+    console.print(table)
+
+
+def _print_subdomains_table(subdomains: list) -> None:
+    if not subdomains:
+        console.print("  [dim]No subdomains found.[/dim]")
+        return
+    table = Table(title=f"Subdomains ({len(subdomains)})", box=box.ROUNDED, border_style="cyan")
+    table.add_column("FQDN",        style="bold white", overflow="fold")
+    table.add_column("IP",          style="dim")
+    table.add_column("HTTP Status", justify="center")
+    table.add_column("Live",        justify="center")
+    table.add_column("Takeover?",   justify="center")
+    for s in subdomains:
+        live_str     = "[green]Yes[/green]" if s.get("is_live") else "[dim]No[/dim]"
+        takeover_str = f"[red]{s['takeover_service']}[/red]" if s.get("takeover_service") else "[dim]-[/dim]"
+        table.add_row(s["fqdn"], s.get("ip","?"),
+                      str(s.get("http_status","?")), live_str, takeover_str)
+    console.print(table)
+
+
+def _print_dirs_table(dirs: list, origin: str) -> None:
+    if not dirs:
+        console.print("  [dim]No interesting paths found.[/dim]")
+        return
+    table = Table(title=f"Paths Found ({len(dirs)})", box=box.ROUNDED, border_style="cyan")
+    table.add_column("Path",       style="bold white", overflow="fold")
+    table.add_column("Status",     justify="center")
+    table.add_column("Size",       justify="right", style="dim")
+    table.add_column("Risk",       justify="center")
+    table.add_column("Confidence", justify="center")
+    for path, status, risk, confidence, reason, blen in dirs:
+        risk_color = RISK_COLOR.get(risk, "white")
+        conf_color = CONF_COLOR.get(confidence, "white")
+        table.add_row(
+            origin + path, str(status), f"{blen} B",
+            f"[{risk_color}]{risk}[/{risk_color}]",
+            f"[{conf_color}]{confidence}[/{conf_color}]",
+        )
+    console.print(table)
+
+
+def _print_xss_table(vulnerable: list) -> None:
+    if not vulnerable:
+        console.print("  [green]No XSS vulnerabilities found.[/green]")
+        return
+    table = Table(title=f"XSS Findings ({len(vulnerable)})", box=box.ROUNDED,
+                  border_style="red")
+    table.add_column("Param",      style="bold red")
+    table.add_column("URL",        style="dim", overflow="fold")
+    table.add_column("Confidence", justify="center")
+    table.add_column("Source Page",style="dim", overflow="fold")
+    for param, payload, url, conf, reason, source in vulnerable:
+        conf_color = CONF_COLOR.get(conf, "white")
+        table.add_row(param, url, f"[{conf_color}]{conf}[/{conf_color}]", source)
+    console.print(table)
+
+
+def _print_sqli_table(vulnerable: list) -> None:
+    if not vulnerable:
+        console.print("  [green]No SQL Injection vulnerabilities found.[/green]")
+        return
+    table = Table(title=f"SQLi Findings ({len(vulnerable)})", box=box.ROUNDED,
+                  border_style="red")
+    table.add_column("Param",      style="bold red")
+    table.add_column("Method",     style="yellow")
+    table.add_column("URL",        style="dim", overflow="fold")
+    table.add_column("Confidence", justify="center")
+    table.add_column("Source Page",style="dim", overflow="fold")
+    for param, method, url, conf, reason, source in vulnerable:
+        conf_color = CONF_COLOR.get(conf, "white")
+        table.add_row(param, method, url, f"[{conf_color}]{conf}[/{conf_color}]", source)
+    console.print(table)
+
+
 # ── ReconScanner ──────────────────────────────────────────────────────────────
 
 class ReconScanner:
@@ -780,16 +1314,23 @@ class ReconScanner:
 
     # ── 6. XSS Scanner ────────────────────────────────────────────────────────
 
-    def scan_xss(self) -> None:
+    def scan_xss(self, points: Optional[list] = None) -> None:
         console.print("\n[bold cyan][6/7] XSS Scanner...[/bold cyan]")
         vulnerable = []
 
-        targets = _collect_injection_points(self.base_url, self.session, self.timeout)
+        # Use crawler-supplied points if available, else fall back to single-page
+        targets = points if points else \
+            _collect_injection_points(self.base_url, self.session, self.timeout)
+
         if not targets:
             console.print("  [dim]No injection points found for XSS testing.[/dim]")
             self.results["xss"] = []
             return
 
+        console.print(
+            f"  [dim]Testing {len(targets)} injection points "
+            f"across {len({p['source_page'] for p in targets if 'source_page' in p} or {self.base_url})} pages[/dim]"
+        )
         total = len(targets) * len(XSS_PAYLOAD_TEMPLATES)
 
         with Progress(SpinnerColumn(), TextColumn("{task.description}"),
@@ -807,11 +1348,12 @@ class ReconScanner:
                         if r:
                             conf = _xss_confidence(r.text, token, payload, high_indicators)
                             if conf in ("High", "Medium"):
+                                source = point.get("source_page", point["url"])
                                 reason = (
                                     f"Canary '{token}' reflects unencoded in response "
                                     f"({'dangerous execution context detected' if conf == 'High' else 'HTML context, structure may be stripped'})"
                                 )
-                                entry = (point["param"], payload, point["url"], conf, reason)
+                                entry = (point["param"], payload, point["url"], conf, reason, source)
                                 if entry not in vulnerable:
                                     vulnerable.append(entry)
                                     self.results["findings"].append(_finding(
@@ -828,15 +1370,21 @@ class ReconScanner:
 
     # ── 7. SQLi Scanner ───────────────────────────────────────────────────────
 
-    def scan_sqli(self) -> None:
+    def scan_sqli(self, points: Optional[list] = None) -> None:
         console.print("\n[bold cyan][7/7] SQL Injection Scanner...[/bold cyan]")
         vulnerable = []
 
-        targets = _collect_injection_points(self.base_url, self.session, self.timeout)
+        targets = points if points else \
+            _collect_injection_points(self.base_url, self.session, self.timeout)
         if not targets:
             console.print("  [dim]No injection points found for SQLi testing.[/dim]")
             self.results["sqli"] = []
             return
+
+        console.print(
+            f"  [dim]Testing {len(targets)} injection points "
+            f"across {len({p['source_page'] for p in targets if 'source_page' in p} or {self.base_url})} pages[/dim]"
+        )
 
         # Baseline RTT for time-based detection
         baseline_rtt = _measure_baseline_rtt(self.session, targets[0], self.timeout)
@@ -947,7 +1495,8 @@ class ReconScanner:
                         confidence = "High"
                         reason += f" AND time-based delay >= {time_threshold:.1f}s"
 
-                entry = (point["param"], method, point["url"], confidence, reason)
+                source = point.get("source_page", point["url"])
+                entry = (point["param"], method, point["url"], confidence, reason, source)
                 if entry not in vulnerable:
                     vulnerable.append(entry)
                     self.results["findings"].append(_finding(
@@ -978,358 +1527,69 @@ class ReconScanner:
         self.port_scan()
         self.enum_subdomains()
         self.dir_bruteforce()
-        self.scan_xss()
-        self.scan_sqli()
-        self._print_summary()
-        return self.results
+        # -- Web crawler --
+        crawler = WebCrawler(self.base_url, self.session, self.timeout)
+        crawl_points = crawler.crawl()
+        self.results["crawl"] = {
+            "pages":      crawler.pages_crawled,
+            "forms":      len(crawler.all_forms),
+            "url_params": len(crawler.all_url_params),
+            "points":     len(crawl_points),
+        }
 
-    # ── Summary ───────────────────────────────────────────────────────────────
+        self.scan_xss(points=crawl_points)
+        self.scan_sqli(points=crawl_points)
 
-    def _print_summary(self) -> None:
-        console.print("\n")
-
-        all_findings = self.results["findings"]
-        high_crit    = [f for f in all_findings
-                        if f["risk"] in ("Critical", "High")]
-        low_info     = [f for f in all_findings
-                        if f["risk"] not in ("Critical", "High")]
+        # ── Final summary ─────────────────────────────────────────────────────
+        findings = self.results["findings"]
+        highs    = [f for f in findings if f["risk"] in ("Critical", "High")]
 
         console.print(Panel(
-            f"[bold white]Scan Summary[/bold white]  "
-            f"[dim]({len(all_findings)} total findings)[/dim]",
+            f"[bold cyan]Scan Complete[/bold cyan]\n"
+            f"[dim]Pages crawled : {crawler.pages_crawled}[/dim]\n"
+            f"[dim]Injection pts : {len(crawl_points)}[/dim]\n"
+            f"[dim]Total findings: {len(findings)}  "
+            f"(High/Critical: {len(highs)})[/dim]",
             border_style="cyan",
         ))
 
-        def _make_table(findings: list, title: str) -> Table:
-            t = Table(title=title, box=box.ROUNDED, border_style="cyan", show_lines=False)
-            t.add_column("Finding Type",  style="bold white",  width=22)
-            t.add_column("Detail",        style="white",        width=46)
-            t.add_column("Risk",          style="bold",         width=10, justify="center")
-            t.add_column("Confidence",    style="bold",         width=11, justify="center")
-            t.add_column("Reason",        style="dim",          width=40)
-
-            seen = set()
-            for f in sorted(findings,
+        if highs:
+            table = Table(title="High / Critical Findings", box=box.ROUNDED,
+                          border_style="red")
+            table.add_column("Type",       style="bold white")
+            table.add_column("Detail",     overflow="fold")
+            table.add_column("Risk",       justify="center")
+            table.add_column("Confidence", justify="center")
+            for f in sorted(highs,
                             key=lambda x: RISK_ORDER.index(x["risk"])):
-                key = (f["type"], f["detail"])
-                if key in seen:
-                    continue
-                seen.add(key)
                 rc = RISK_COLOR.get(f["risk"], "white")
-                cc = CONF_COLOR.get(f.get("confidence", "High"), "white")
-                t.add_row(
-                    f["type"],
-                    f["detail"][:46] + ("…" if len(f["detail"]) > 46 else ""),
+                cc = CONF_COLOR.get(f["confidence"], "white")
+                table.add_row(
+                    f["type"], f["detail"],
                     f"[{rc}]{f['risk']}[/{rc}]",
-                    f"[{cc}]{f.get('confidence','High')}[/{cc}]",
-                    f.get("reason", "")[:40],
+                    f"[{cc}]{f['confidence']}[/{cc}]",
                 )
-            return t
+            console.print(table)
 
-        if high_crit:
-            console.print(_make_table(high_crit, "High / Critical Findings"))
-        else:
-            console.print("  [green]No High or Critical findings.[/green]")
-
-        c = sum(1 for f in all_findings if f["risk"] == "Critical")
-        h = sum(1 for f in all_findings if f["risk"] == "High")
-        m = sum(1 for f in all_findings if f["risk"] == "Medium")
-        console.print(
-            f"\n  [bold bright_red]{c} Critical[/bold bright_red]  "
-            f"[bold red]{h} High[/bold red]  "
-            f"[yellow]{m} Medium[/yellow]  "
-            f"[dim]{len(low_info)} Low/Info[/dim]"
-        )
-
-        if low_info:
-            show_all = Confirm.ask(
-                "\n  [cyan]Show all findings including Low/Info?[/cyan]",
-                default=False,
-            )
-            if show_all:
-                console.print(_make_table(all_findings, "All Findings"))
+        return self.results
 
 
-# ── Injection Point Helpers ───────────────────────────────────────────────────
-
-def _collect_injection_points(base_url: str, session: requests.Session,
-                               timeout: int) -> list[dict]:
-    points = []
-    parsed = urllib.parse.urlparse(base_url)
-    qs     = urllib.parse.parse_qs(parsed.query)
-
-    for param in qs:
-        points.append({
-            "type":   "url",
-            "url":    base_url,
-            "method": "GET",
-            "param":  param,
-            "data":   {k: v[0] for k, v in qs.items()},
-        })
-
-    try:
-        r = session.get(base_url, timeout=timeout, verify=False)
-        for form in _parse_forms(r.text, base_url):
-            for field in form["fields"]:
-                points.append({
-                    "type":   "form",
-                    "url":    form["action"],
-                    "method": form["method"],
-                    "param":  field,
-                    "data":   {f: "test" for f in form["fields"]},
-                })
-    except Exception:
-        pass
-
-    return points
-
-
-def _parse_forms(html: str, base_url: str) -> list[dict]:
-    forms       = []
-    parsed_base = urllib.parse.urlparse(base_url)
-    form_blocks = re.findall(r"<form[^>]*>(.*?)</form>", html, re.IGNORECASE | re.DOTALL)
-    form_tags   = re.findall(r"<form([^>]*)>",           html, re.IGNORECASE)
-
-    for tag_attrs, body in zip(form_tags, form_blocks):
-        action_m = re.search(r'action=["\']([^"\']*)["\']', tag_attrs, re.IGNORECASE)
-        method_m = re.search(r'method=["\']([^"\']*)["\']', tag_attrs, re.IGNORECASE)
-        action   = action_m.group(1) if action_m else base_url
-        method   = method_m.group(1).upper() if method_m else "GET"
-        if action and not action.startswith("http"):
-            action = urllib.parse.urljoin(
-                f"{parsed_base.scheme}://{parsed_base.netloc}", action)
-        fields = re.findall(r'<input[^>]+name=["\']([^"\']+)["\']', body, re.IGNORECASE)
-        ta     = re.findall(r'<textarea[^>]+name=["\']([^"\']+)["\']', body, re.IGNORECASE)
-        all_f  = list(set(fields + ta))
-        if all_f:
-            forms.append({"action": action, "method": method, "fields": all_f})
-    return forms
-
-
-def _inject(session: requests.Session, point: dict, payload: str,
-            timeout: int) -> Optional[requests.Response]:
-    data = dict(point["data"])
-    data[point["param"]] = payload
-    try:
-        if point["method"] == "GET" or point["type"] == "url":
-            return session.get(point["url"], params=data, timeout=timeout, verify=False)
-        return session.post(point["url"], data=data, timeout=timeout, verify=False)
-    except Exception:
-        return None
-
-
-# ── Print Helpers ─────────────────────────────────────────────────────────────
-
-def _print_headers_table(headers: list[dict]) -> None:
-    table = Table(title="Security Headers", box=box.ROUNDED, border_style="cyan")
-    table.add_column("Header",       style="bold white", width=30)
-    table.add_column("Status",       style="bold",       width=14, justify="center")
-    table.add_column("Risk",         style="bold",       width=10, justify="center")
-    table.add_column("Value / Reason", style="dim",      width=50)
-
-    color_map = {"PRESENT": "green", "MISSING": "red", "MISCONFIGURED": "yellow"}
-    for h in headers:
-        sc  = color_map.get(h["status"], "white")
-        rc  = RISK_COLOR.get(h["risk"], "white")
-        val = h["value"] if h["value"] else h["reason"]
-        table.add_row(
-            h["header"],
-            f"[{sc}]{h['status']}[/{sc}]",
-            f"[{rc}]{h['risk']}[/{rc}]",
-            val[:50],
-        )
-    console.print(table)
-
-
-def _print_ssl_table(info: dict) -> None:
-    table = Table(title="SSL Certificate", box=box.ROUNDED, border_style="cyan")
-    table.add_column("Field", style="bold white", width=20)
-    table.add_column("Value", style="white")
-
-    if not info.get("valid", True) and "error" in info:
-        table.add_row("Error", f"[red]{info['error'][:80]}[/red]")
-        console.print(table)
-        return
-
-    days = info.get("days_left", 0)
-    if info.get("expired"):
-        days_str = f"[bold bright_red]EXPIRED ({abs(days)} days ago)[/bold bright_red]"
-    elif info.get("warning"):
-        days_str = f"[yellow]{days} days — renew soon[/yellow]"
-    else:
-        days_str = f"[green]{days} days[/green]"
-
-    table.add_row("Subject",     info.get("subject",     "N/A"))
-    table.add_row("Issuer",      info.get("issuer",      "N/A"))
-    table.add_row("Expires",     info.get("expires",     "N/A"))
-    table.add_row("Days Left",   days_str)
-    table.add_row("Valid",       "[green]Yes[/green]" if info.get("valid") else "[red]No[/red]")
-    table.add_row("TLS Version", info.get("tls_version", "N/A"))
-
-    self_signed = info.get("is_self_signed")
-    if self_signed is not None:
-        table.add_row("Self-Signed",
-                      "[bold red]Yes[/bold red]" if self_signed else "[green]No[/green]")
-
-    domain_match = info.get("domain_match")
-    if domain_match is not None:
-        table.add_row("Domain Match",
-                      "[green]Yes[/green]" if domain_match else "[bold red]No[/bold red]")
-
-    weak_tls = info.get("weak_tls", [])
-    if weak_tls:
-        table.add_row("Weak TLS", f"[bold red]{', '.join(weak_tls)}[/bold red]")
-    else:
-        table.add_row("Weak TLS", "[green]None accepted[/green]")
-
-    console.print(table)
-
-
-def _print_ports_table(ports: list[tuple]) -> None:
-    table = Table(title="Port Scan", box=box.ROUNDED, border_style="cyan")
-    table.add_column("Port",    style="bold white", width=6)
-    table.add_column("Service", style="white",      width=12)
-    table.add_column("Status",  style="bold",       width=8,  justify="center")
-    table.add_column("Risk",    style="bold",       width=10, justify="center")
-    table.add_column("Banner / Context", style="dim", width=50)
-
-    for port, service, is_open, risk, context, banner in ports:
-        rc = RISK_COLOR.get(risk, "white")
-        if is_open:
-            status_str = "[green]OPEN[/green]"
-            detail     = banner if banner else context
-        else:
-            status_str = "[dim]closed[/dim]"
-            detail     = ""
-            rc         = "white"
-            risk       = ""
-        table.add_row(str(port), service, status_str,
-                      f"[{rc}]{risk}[/{rc}]" if risk else "",
-                      detail[:50])
-    console.print(table)
-
-
-def _print_subdomains_table(subdomains: list[dict]) -> None:
-    if not subdomains:
-        console.print("  [dim]No subdomains resolved.[/dim]")
-        return
-    table = Table(title=f"Subdomains ({len(subdomains)})", box=box.ROUNDED, border_style="cyan")
-    table.add_column("Subdomain",   style="bold cyan",   width=40)
-    table.add_column("IP",          style="white",       width=16)
-    table.add_column("HTTP",        style="white",       width=6,  justify="center")
-    table.add_column("Takeover?",   style="bold",        width=12, justify="center")
-
-    for s in subdomains:
-        http_str = str(s["http_status"]) if s["http_status"] else "[dim]N/A[/dim]"
-        tko      = s["takeover_service"]
-        tko_str  = f"[bold bright_red]{tko}[/bold bright_red]" if tko else "[dim]No[/dim]"
-        table.add_row(s["fqdn"], s["ip"], http_str, tko_str)
-    console.print(table)
-
-
-def _print_dirs_table(dirs: list[tuple], origin: str) -> None:
-    if not dirs:
-        console.print("  [dim]No interesting paths found.[/dim]")
-        return
-    table = Table(title=f"Paths Found ({len(dirs)})", box=box.ROUNDED, border_style="cyan")
-    table.add_column("Path",       style="bold white",  width=42)
-    table.add_column("Status",     style="bold",        width=8,  justify="center")
-    table.add_column("Risk",       style="bold",        width=9,  justify="center")
-    table.add_column("Confidence", style="bold",        width=11, justify="center")
-    table.add_column("Bytes",      style="dim",         width=7,  justify="right")
-
-    sc_map = {200: "green", 301: "yellow", 302: "yellow", 403: "dim"}
-    for path, status, risk, confidence, reason, blen in sorted(
-            dirs, key=lambda x: RISK_ORDER.index(x[2])):
-        sc = sc_map.get(status, "white")
-        rc = RISK_COLOR.get(risk, "white")
-        cc = CONF_COLOR.get(confidence, "white")
-        table.add_row(
-            origin + path,
-            f"[{sc}]{status}[/{sc}]",
-            f"[{rc}]{risk}[/{rc}]",
-            f"[{cc}]{confidence}[/{cc}]",
-            str(blen),
-        )
-    console.print(table)
-
-
-def _print_xss_table(vulns: list[tuple]) -> None:
-    if not vulns:
-        console.print("  [green]No reflected XSS found.[/green]")
-        return
-    table = Table(title=f"XSS Vulnerabilities ({len(vulns)})",
-                  box=box.ROUNDED, border_style="red")
-    table.add_column("Parameter",  style="bold red",   width=14)
-    table.add_column("Confidence", style="bold",       width=11, justify="center")
-    table.add_column("Payload",    style="yellow",     width=42)
-    table.add_column("URL",        style="dim",        width=40)
-
-    for param, payload, url, confidence, reason in vulns:
-        cc = CONF_COLOR.get(confidence, "white")
-        table.add_row(param, f"[{cc}]{confidence}[/{cc}]", payload[:42], url[:40])
-    console.print(table)
-
-
-def _print_sqli_table(vulns: list[tuple]) -> None:
-    if not vulns:
-        console.print("  [green]No SQL injection found.[/green]")
-        return
-    table = Table(title=f"SQL Injection ({len(vulns)})",
-                  box=box.ROUNDED, border_style="magenta")
-    table.add_column("Parameter",  style="bold magenta", width=14)
-    table.add_column("Method",     style="bold",         width=30)
-    table.add_column("Confidence", style="bold",         width=11, justify="center")
-    table.add_column("URL",        style="dim",          width=40)
-
-    for param, method, url, confidence, reason in vulns:
-        cc = CONF_COLOR.get(confidence, "white")
-        table.add_row(param, method, f"[{cc}]{confidence}[/{cc}]", url[:40])
-    console.print(table)
-
-
-# ── Entry Point ───────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def run_scanner() -> None:
+    """Interactive entry point called from main.py."""
     console.print(Panel(
         "[bold cyan]Active Recon Scanner[/bold cyan]\n"
-        "[dim]Runs: headers · SSL · ports · subdomains · dirs · XSS · SQLi[/dim]\n"
-        "[bold red]Only scan targets you have explicit written permission to test.[/bold red]",
+        "[dim]Crawls the full site, then tests every parameter for XSS and SQLi.[/dim]",
         border_style="cyan",
     ))
 
-    target = Prompt.ask("\n  [cyan]Enter target URL or domain[/cyan]").strip()
+    target = Prompt.ask("\n  [bold cyan]Target URL[/bold cyan]").strip()
     if not target:
-        console.print("[red]  No target provided.[/red]")
+        console.print("[red]No target supplied. Aborting.[/red]")
         return
 
-    no_robots = Confirm.ask(
-        "  [cyan]Bypass robots.txt restrictions?[/cyan]", default=False)
+    no_robots = Confirm.ask("  Ignore robots.txt?", default=False)
 
     scanner = ReconScanner(target, respect_robots=not no_robots)
-    results = scanner.run_full_scan(no_robots=no_robots)
-
-    critical = [f for f in results["findings"] if f["risk"] in ("Critical", "High")]
-    if critical:
-        console.print(f"\n  [bold red]{len(critical)} High/Critical findings.[/bold red]")
-        if Confirm.ask(
-            "  [cyan]Generate a bug bounty report for these findings?[/cyan]",
-            default=True,
-        ):
-            from report_generator import run_report_generator
-            sqli = any(f["type"] == "SQL Injection"  for f in critical)
-            xss  = any(f["type"] == "XSS Reflected"  for f in critical)
-            sslx = any(f["type"] == "SSL Expired"     for f in critical)
-            tko  = any(f["type"] == "Subdomain Takeover" for f in critical)
-            if sqli:
-                score, sev, vuln = 9.8, "Critical", "SQLI"
-            elif xss:
-                score, sev, vuln = 8.8, "High",     "XSS"
-            elif tko:
-                score, sev, vuln = 9.1, "Critical", "IDOR"
-            elif sslx:
-                score, sev, vuln = 7.5, "High",     "AUTH_BYPASS"
-            else:
-                score, sev, vuln = 7.0, "High",     "AUTH_BYPASS"
-            run_report_generator(prefill_score=score, prefill_severity=sev,
-                                 prefill_vuln=vuln)
+    scanner.run_full_scan(no_robots=no_robots)
