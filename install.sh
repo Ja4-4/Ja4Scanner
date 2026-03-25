@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Ja4Scanner — Linux Installer
-# Usage: sudo ./install.sh
 
 set -euo pipefail
 
@@ -27,7 +25,7 @@ cat << 'EOF'
  \___/ \__,_| |_||_||_| |____/ \___\__,_|_| |_|_| |_|\___|_|
 EOF
 echo -e "${RESET}"
-echo -e "${BOLD}  Ja4Scanner — Linux Installer${RESET}"
+echo -e "${BOLD}  Ja4Scanner — Author: DEV Ja4_ Telegram: tnst7 ${RESET}"
 echo ""
 
 # ── 1. Root check ──────────────────────────────────────────────────────────────
